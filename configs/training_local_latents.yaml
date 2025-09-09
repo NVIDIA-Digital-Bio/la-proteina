@@ -1,0 +1,95 @@
+run_name_: test_release_diffusion
+
+hardware:
+  ncpus_per_task_train_: 24  # Number of CPUs per tast during training
+  ncpus_per_task_prepro_: 32  # Number of CPUs used for data preprocessing run
+  accelerator: gpu
+  ngpus_per_node_: 1
+  nnodes_: 1
+
+defaults:
+  - dataset: pdb/pdb_train_ucond
+  - nn: local_latents_score_nn_160M
+  - generation: validation_local_latents    # specifies all arguments for validation
+  - _self_
+
+
+# Pre-training checkpoint to start from there
+pretrain_ckpt_path:
+
+
+# Modalities to use
+product_flowmatcher:
+  bb_ca:
+    zero_com_noise: True  # whether to center noise samples
+    guidance_enabled: True  # whether this modality can use guidance
+    dim: 3  # Only CA atoms in bb_ca
+  local_latents:
+    zero_com_noise: False  # whether to center noise samples
+    guidance_enabled: True
+    dim: null  # Overwritten in the code by the correct value loaded from the autoencoder (likely 4 or 8)
+    
+
+autoencoder_ckpt_path: ./checkpoints_laproteina/AE1_ucond_512.ckpt
+
+# Loss
+loss:
+  t_distribution:
+    bb_ca:
+      name: mix_unif_beta
+      p1: 1.9
+      p2: 1.0
+      p3: 0.02
+    local_latents:
+      name: mix_unif_beta
+      p1: 1.0
+      p2: 1.5
+      p3: 0.2
+
+    shared_groups:
+
+# Precision
+force_precision_f32: False  # If false will use bf16-mixed precision
+
+# Training
+training:
+  n_recycle: 0
+  motif_conditioning: False
+  self_cond: True
+  p_folding_n_inv_folding_iters: 0.1
+
+# LoRA
+lora:
+  r: null   # Rank of low-rank adpation of matrices. Set r as null to turn off lora
+  lora_alpha: 32.0     # Scaling of lora matrices
+  lora_dropout: 0.0   # Dropout of lora inputs
+  train_bias: none  # Fine-tune bias or not. ['none', 'all', 'lora_only']
+
+# Optimization
+opt:
+  lr: 0.0001
+  max_epochs: 10000000
+  accumulate_grad_batches: 1
+  skip_nan_grad: False  # Skip updates with nan gradient
+  grad_and_weight_analysis: False  # Log some statistics of gradients and weights
+  dist_strategy: ddp  # For multi GPU training, do not change
+  val_check_interval: 5000  # Number of training steps after which we check validation loss
+
+# wandb logging and checkpoints
+log:
+  wandb_project: laproteina
+  log_wandb: False  # whether to log to wandb
+  log_every_n_steps: 10  # wandb logging frequency
+  checkpoint: True  # whether to store checkpoints
+  checkpoint_every_n_steps: 10000  # How often we store a checkpoint, should be greater than val_check_interval in `opt`
+  last_ckpt_every_n_steps: 1500  # How often do we update our last ckpt, needed for requeuing without losing progress
+
+seed: 42
+
+ema:
+  decay: 0.999  # 0 means no EMA, so all the EMA machinery is unused and no EMA checkpoints are stored
+  validate_original_weights: False  # Whether to run validation on regular or EMA weights
+  every_n_steps: 1  # Frequency of EMA updates
+  cpu_offload: False  # Whether to offload EMA weights to cpu
+
+

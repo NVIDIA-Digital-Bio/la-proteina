@@ -1,0 +1,49 @@
+name: laproteina_env
+channels:
+  - nvidia
+  - pytorch
+  - conda-forge
+  - pyg
+  - bioconda
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pip
+  - conda-forge::transformers=4.48.3
+  - bioconda::mmseqs2=17.b804f
+  - pip:
+    - python-dotenv==1.0.1
+    - einops==0.6
+    - dm-tree==0.1.8
+    - lightning==2.5.0
+    - loguru==0.7.2
+    - hydra-core==1.3.1
+    - numpy==1.23.5
+    - pandas==2.3.0
+    - biopandas==0.5.1
+    - wandb==0.17.0
+    - wget==3.2
+    - tqdm==4.66.4
+    - ml-collections==0.1.1
+    - jaxtyping
+    - loralib
+    - biopython
+    - biotite>=0.41.0
+    - cpdb-protein==0.2.0
+    - pre-commit>=4.0.0
+    - joblib==1.4.2
+    - rich==14.0.0
+    - deepdiff
+    - multipledispatch
+    - plotly
+    - pydantic
+    - rich-click
+    - scikit-learn
+    - seaborn
+    - xarray
+
+
+# To create the full environment, run at the end:
+# pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu118
+# pip install graphein==1.7.7 --no-deps
+# pip install torch_geometric torch_scatter torch_sparse torch_cluster -f https://data.pyg.org/whl/torch-2.7.0+cu118.html

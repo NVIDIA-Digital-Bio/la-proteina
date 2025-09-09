@@ -1,0 +1,73 @@
+# General sampling params
+args:
+  fold_cond: False     # not supported
+
+
+# Sampling dataset
+dataset:
+  # Lengths to sample. If not None, then use length-centric sampling
+  # Uses `nres_lens` if specified, otherwise arange(min_len, max_len+1, step)
+  nlens_cfg:
+    nres_lens: [100, 200, 300, 400, 500]
+    min_len:
+    max_len:
+    step_len:
+
+  cath_codes: null
+
+  # Number of samples per protein length or per cath code
+  nsamples: 100
+
+  # Maximum number of samples in each batch
+  max_nsamples_per_batch: 10
+
+
+  # Empirical (length, cath code) distribution
+  empirical_distribution_cfg:
+    # Path to the empirical (len, cath_code) distribution file
+    len_cath_code_path: null
+
+    # Level of cath codes to generate
+    cath_code_level: null
+
+    # Arguments for bucketizing the length distribution
+    bucket_min_len: 50
+    bucket_max_len: 274
+    bucket_step_size: 25
+
+
+# Sampling metrics
+metric:
+  # Designability
+  compute_designability: True
+  designability_folding_models: ["esmfold"]  # List of folding models to use
+  
+  # codesign metrics
+  compute_codesignability: True
+  codesignability_folding_models: ["esmfold"]  # List of folding models to use
+  compute_co_sequence_recovery: False
+
+  # Novelty
+  compute_novelty_pdb: False
+  compute_novelty_afdb: False
+  compute_novelty_afdb_rep_v4: False
+  compute_novelty_afdb_rep_v4_geniefilters_maxlen512: False
+
+  # motif scaffolding
+  compute_motif_scaffolding: False
+  compute_motif_backbone_designability: False  # backbone scRMSD
+  compute_motif_aa_designability: False    # all-atom scRMSD
+  compute_motif_rmsd: False
+
+  # Output management
+  keep_folding_outputs: True
+
+  # binder design
+  compute_binder_metrics: False
+
+  # multimer generation
+  compute_multimer_metrics: False
+
+  # FID-related metrics
+  compute_fid: False
+  metric_factory: null

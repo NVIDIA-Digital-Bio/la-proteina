@@ -1,0 +1,67 @@
+run_name_: test_release_ae
+
+hardware:
+  ncpus_per_task_train_: 24  # Number of CPUs per tast during training
+  ncpus_per_task_prepro_: 32  # Number of CPUs used for data preprocessing run
+  accelerator: gpu
+  ngpus_per_node_: 1  # Number of GPUs per node
+  nnodes_: 1  # Number of nodes
+
+defaults:
+  - nn_ae: nn_130m
+  - dataset: pdb/pdb_train_ucond
+  - _self_
+
+# Pre-training checkpoint to start from there
+pretrain_ckpt_path:
+
+# Loss
+loss:
+  kl:
+    weight: 1e-4
+    anneal: false
+    patience: 10000
+  struct:
+    type: l2
+    # type: l2cut_0.01
+    weight: 1.0
+  seq:
+    weight: 1.0
+
+
+# Precision
+force_precision_f32: False  # If false will use bf16-mixed precision
+
+# Optimization
+opt:
+  lr: 0.0001
+  max_epochs: 10000000
+  accumulate_grad_batches: 1
+  skip_nan_grad: False  # Skip updates with nan gradient
+  grad_and_weight_analysis: True  # Log some statistics of gradients and weights
+  dist_strategy: ddp  # For multi GPU training, do not change
+  val_check_interval: 5000  # Number of training steps after which we check validation loss
+  skip_large_grad_updates:
+    use: False  # Do not skip updates large gradients
+    moving_avg_size: 100
+    factor_threshold: 10
+    min_opt_steps: 1500
+
+# wandb logging and checkpoints
+log:
+  wandb_project: protein_ae
+  log_wandb: False  # whether to log to wandb
+  log_every_n_steps: 1  # wandb logging frequency
+  checkpoint: True  # whether to store checkpoints
+  checkpoint_every_n_steps: 10000  # How often we store a checkpoint, should be greater than val_check_interval in `opt`
+  last_ckpt_every_n_steps: 1500  # How often do we update our last ckpt, needed for requeuing without losing progress
+
+seed: 42
+
+ema:
+  decay: 0.999  # 0 means no EMA, so all the EMA machinery is unused and no EMA checkpoints are stored
+  validate_original_weights: False  # Whether to run validation on regular or EMA weights
+  every_n_steps: 1  # Frequency of EMA updates
+  cpu_offload: False  # Whether to offload EMA weights to cpu
+
+

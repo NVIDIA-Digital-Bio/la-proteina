@@ -1,0 +1,167 @@
+# General sampling params
+args:
+  # some params for sampling
+  nsteps: 200
+  self_cond: False
+  fold_cond: False
+  guidance_w: 1.0   # conditional model weights, 1.0 for conditional generation, 0.0 for unconditional generation. We typically set this value greater than 1
+  # Always set autoguidance as 0.0 during validation
+  ag_ratio: 0.0   # a value between 0 and 1, determining the proportion of autoguidance v.s. classifier-free guidance, 1.0 for all autoguidance, 0.0 for all CFG
+  ag_ckpt_path: null    # path to bad model checkpoint
+
+
+# Sampling dataset
+dataset:
+  # Validation sampling dataset
+  # Lengths to sample. If not None, then use length-centric sampling
+  # Uses `nres_lens` if specified, otherwise arange(min_len, max_len+1, step)
+  nlens_cfg:
+    nres_lens: [50, 100, 150, 200, 250]
+    min_len:
+    max_len:
+    step_len:
+
+  # CATH codes to sample. If not None and nlens_cfg is None, then use fold-centric sampling
+  cath_codes: null       # ["1.x.x.x", "2.x.x.x", "3.x.x.x"]
+
+  # Number of samples per protein length or per cath code
+  nsamples: 20
+
+  # Maximum number of samples in each batch
+  max_nsamples_per_batch: 5
+
+  # Empirical (length, cath code) distribution
+  empirical_distribution_cfg:
+    # Path to the empirical (len, cath_code) distribution file
+    len_cath_code_path: null
+
+    # Level of cath codes to generate
+    cath_code_level: null
+
+    # Arguments for bucketizing the length distribution
+    bucket_min_len: 50
+    bucket_max_len: 274
+    bucket_step_size: 25
+
+model:
+  ode:
+    bb_ca:
+      schedule:
+        mode: uniform
+        p: 1.0
+      gt:
+        mode: "tan"
+        p: 1.0
+        clamp_val: null
+      simulation_step_params:
+        sampling_mode: vf
+        sc_scale_noise: 0.0
+        sc_scale_score: 0.0
+        t_lim_ode: 0.98
+        t_lim_ode_below: 0.02
+        center_every_step: True
+    local_latents:
+      schedule:
+        mode: uniform
+        p: 1.0
+      gt:
+        mode: "tan"
+        p: 1.0
+        clamp_val: null
+      simulation_step_params:
+        sampling_mode: vf
+        sc_scale_noise: 0.0
+        sc_scale_score: 0.0
+        t_lim_ode: 0.98
+        t_lim_ode_below: 0.02
+        center_every_step: False
+  
+  temp_035_only_ca:
+    bb_ca:
+      schedule:
+        mode: uniform
+        p: 1.0
+      gt:
+        mode: "tan"
+        p: 1.0
+        clamp_val: null
+      simulation_step_params:
+        sampling_mode: sc
+        sc_scale_noise: 0.35
+        sc_scale_score: 1.0
+        t_lim_ode: 0.98
+        t_lim_ode_below: 0.02
+        center_every_step: True
+    local_latents:
+      schedule:
+        mode: uniform
+        p: 1.0
+      gt:
+        mode: "tan"
+        p: 1.0
+        clamp_val: null
+      simulation_step_params:
+        sampling_mode: vf
+        sc_scale_noise: 0.0
+        sc_scale_score: 0.0
+        t_lim_ode: 0.98
+        t_lim_ode_below: 0.02
+        center_every_step: False
+  
+  temp_035_all:
+    bb_ca:
+      schedule:
+        mode: uniform
+        p: 1.0
+      gt:
+        mode: "tan"
+        p: 1.0
+        clamp_val: null
+      simulation_step_params:
+        sampling_mode: sc
+        sc_scale_noise: 0.35
+        sc_scale_score: 1.0
+        t_lim_ode: 0.98
+        t_lim_ode_below: 0.02
+        center_every_step: True
+    local_latents:
+      schedule:
+        mode: uniform
+        p: 1.0
+      gt:
+        mode: "tan"
+        p: 1.0
+        clamp_val: null
+      simulation_step_params:
+        sampling_mode: sc
+        sc_scale_noise: 0.35
+        sc_scale_score: 1.0
+        t_lim_ode: 0.98
+        t_lim_ode_below: 0.02
+        center_every_step: False
+
+# Sampling metrics
+metric:
+  # Designability
+  compute_designability: False
+
+  # Novelty
+  compute_novelty_pdb: False
+  compute_novelty_afdb: False
+
+  # FID-related metrics
+  compute_fid: True
+  metric_factory:
+    - metrics: ["FID", "fJSD_C", "fJSD_A", "fJSD_T"]
+      ckpt_path: ${oc.env:DATA_PATH}/metric_factory/model_weights/gearnet_ca.pth
+      real_features_path: ${oc.env:DATA_PATH}/metric_factory/features/pdb_eval_ca_features.pth
+      ca_only: True
+      prefix: PDB_
+    - metrics: ["FID", "fJSD_C", "fJSD_A", "fJSD_T"]
+      ckpt_path: ${oc.env:DATA_PATH}/metric_factory/model_weights/gearnet_ca.pth
+      real_features_path: ${oc.env:DATA_PATH}/metric_factory/features/afdb_eval_ca_features.pth
+      ca_only: True
+      prefix: AFDB_
+    - metrics: ["IS_C", "IS_A", "IS_T"]
+      ckpt_path: ${oc.env:DATA_PATH}/metric_factory/model_weights/gearnet_ca.pth
+      ca_only: True

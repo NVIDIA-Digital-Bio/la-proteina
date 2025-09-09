@@ -1,0 +1,16 @@
+defaults:
+  - inference_base
+  - generation: motif
+  - _self_
+
+run_name_: laproteina_motif_idx_tip
+ckpt_name: LD5_motif_idx_tip.ckpt
+autoencoder_ckpt_path: ./checkpoints_laproteina/AE3_motif.ckpt
+
+generation:
+  model:
+    bb_ca:
+      simulation_step_params:
+        center_every_step: False  # Whether to center the sample every step
+  dataset:
+    motif_task_name: 1YCR_AA_TIP

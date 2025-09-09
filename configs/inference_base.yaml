@@ -1,0 +1,59 @@
+run_name_:
+ckpt_path: ./checkpoints_laproteina
+ckpt_name: 
+autoencoder_ckpt_path: 
+
+# Job management
+ncpus_: 24
+seed: 5
+gen_njobs: 1  # Leave as 1
+eval_njobs: 1  # Leave as 1
+
+# All sampling arugments that we want to change frequently
+generation:
+  n_recycle: 0  # Leave as 0
+
+  # General sampling params
+  args:
+    nsteps: 400
+    self_cond: True
+
+    # Guidance
+    guidance_w: 1.0   # guidance model weights, 1.0 for w/o CFG and autoguidance, 0.0 for excluding the main model
+    ag_ratio: 0.0   # a value between 0 and 1, determining the proportion of autoguidance v.s. classifier-free guidance, 1.0 for all autoguidance, 0.0 for all CFG -- ag not supported for now
+    ag_ckpt_path: null  # path to bad model checkpoint
+
+    save_trajectory_every: 0 # at which step interval to save trajectory snapshots of generation, 0 for no saving
+
+  # Model-specific sampling arguments
+  model:
+    bb_ca:
+      schedule:
+        mode: log
+        p: 2.0
+      gt:
+        mode: "1/t"
+        p: 1.0
+        clamp_val: null
+      simulation_step_params:
+        sampling_mode: sc  # Options are: vf (plain fow matching) or sc (using score, where parameters below matter)
+        sc_scale_noise: 0.1  # scale used to multiply noise if mode == sc
+        sc_scale_score: 1.0  # scale used to multiply score if mode == sc
+        t_lim_ode: 0.98  # At what point between 0 and 1 we switch to ODE with score scaling (for sc mode)
+        t_lim_ode_below: 0.02  # Before what point between 0 and 1 we use sc mode (for vf_ss mode)
+        center_every_step: True  # Whether to center the sample every step
+    local_latents:
+      schedule:
+        mode: power
+        p: 2.0
+      gt:
+        mode: "tan"
+        p: 1.0
+        clamp_val: null
+      simulation_step_params:
+        sampling_mode: sc
+        sc_scale_noise: 0.1
+        sc_scale_score: 1.0
+        t_lim_ode: 0.98
+        t_lim_ode_below: 0.02
+        center_every_step: False

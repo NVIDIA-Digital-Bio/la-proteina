@@ -1,0 +1,1 @@
+Follow the instructions in the readme to download checkpoints, which should be placed in this directory.

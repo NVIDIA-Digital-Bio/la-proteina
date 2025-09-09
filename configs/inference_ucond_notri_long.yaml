@@ -1,0 +1,17 @@
+defaults:
+  - inference_base
+  - generation: uncond_codes_800
+  - _self_
+
+run_name_: laproteina_ucond_notri_long
+ckpt_name: LD3_ucond_notri_800.ckpt
+autoencoder_ckpt_path: ./checkpoints_laproteina/AE2_ucond_800.ckpt
+
+generation:
+  model:
+    bb_ca:
+      simulation_step_params:
+        sc_scale_noise: 0.15  # scale used to multiply noise if mode == sc
+    local_latents:
+      simulation_step_params:
+        sc_scale_noise: 0.05  # scale used to multiply noise if mode == sc

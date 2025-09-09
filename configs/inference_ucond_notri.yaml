@@ -1,0 +1,8 @@
+defaults:
+  - inference_base
+  - generation: uncond_codes
+  - _self_
+
+run_name_: laproteina_ucond_notri
+ckpt_name: LD1_ucond_notri_512.ckpt
+autoencoder_ckpt_path: ./checkpoints_laproteina/AE1_ucond_512.ckpt

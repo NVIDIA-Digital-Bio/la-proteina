@@ -1,0 +1,25 @@
+# Checkpoint
+ckpt_file: /home/tgeffner/Desktop/protein-foundation-models/checkpoints_laproteina/AE1_ucond_512.ckpt
+
+# Job management
+ncpus_: 24
+seed: 5
+
+# Which data to test autoencoder on, and how many structures
+dataset: genie2  # or pdb
+n_structs: 1000
+bs: 20
+
+# Stuff to compute
+metrics:
+  bb_rmsd: false
+  all_atom_rmsd: true
+  seq_rec_rate: true
+  seq_cross_entropy: false
+  kl_latent_dist: true
+  std_latent_dist: false
+
+plot:
+  pca_latents: false
+  pca_latents_per_residue_type: true
+

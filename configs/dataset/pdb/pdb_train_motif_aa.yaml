@@ -1,0 +1,54 @@
+datamodule:
+  _target_: "proteinfoundation.datasets.pdb_data.PDBLightningDataModule"
+  data_dir: ${oc.env:DATA_PATH}/pdb_train/ # Directory where the dataset is stored
+  in_memory: False
+  format: "cif" # format for file download
+  overwrite: False # Whether to overwrite existing dataset files and reprocess the raw data
+  # arguments for BaseLightningDataModule class
+  batch_padding: True # whether we want a sparse PyG batch or a padded dense batch
+  sampling_mode: "cluster-random" # sample randomly inside each sequence similarity cluster during training
+  transforms:
+    - _target_: "proteinfoundation.datasets.transforms.CoordsToNanometers"
+    - _target_: "proteinfoundation.datasets.transforms.CenterStructureTransform"
+    - _target_: "proteinfoundation.datasets.transforms.GlobalRotationTransform"
+    - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"
+    - _target_: "proteinfoundation.datasets.transforms.MotifMaskTransform"
+      atom_selection_mode: "all"
+      motif_max_pct_res: 0.3
+      motif_prob: 1.0
+    - _target_: "proteinfoundation.datasets.transforms.CenteringTransform"
+      center_mode: "motif"
+      data_mode: "all-atom"
+    - _target_: "proteinfoundation.datasets.transforms.ExtractMotifCoordinatesTransform"
+  batch_size: 2 # Batch size for dataloader
+  num_workers: 16 # Number of workers for dataloader
+  pin_memory: True # Pin memory for dataloader
+
+  dataselector:
+    _target_: "proteinfoundation.datasets.pdb_data.PDBDataSelector"
+    data_dir: ${oc.env:DATA_PATH}/pdb_train/ # Directory where the dataset is stored
+    fraction: 0.001 # Fraction of dataset to use
+    molecule_type: "protein" # Type of molecule for which to select
+    experiment_types: ["diffraction", "EM"] # other options are "NMR" and "other"
+    min_length: 50 # Exclude peptides of length 50
+    max_length: 256 # Exclude polypeptides greater than length 500
+    oligomeric_min: null 
+    oligomeric_max: null 
+    best_resolution: 0.0  # Include only proteins with resolution >= 0.0
+    worst_resolution: 5.0 # Include only proteins with resolution <= 5.0
+    has_ligands: [] # Include only proteins containing the ligand `ZN`
+    remove_ligands: [] # Exclude specific ligands from any available protein-ligand complexes
+    remove_non_standard_residues: True # Include only proteins containing standard amino acid residues
+    remove_pdb_unavailable: True # Include only proteins that are available to download
+    exclude_ids: ["9b57", "9b5p", "9b5s", "9b5n", "9b5a", "9b5k", "9b5v", "9b59", "9b5w", "9b5g", "9b5i", "9b5x", "9b5d", "9b5e", "9b5t", "9b5f", 
+                  "9b5o", "9b58", "9b5u", "9b5c", "9b5j", "9b5b", "9b5h", "9b5q", "9b5l", "9b56", "9b5m", "9b5l", "9b55", "9b5r", "9ij9", "9iix",
+                  "2ezq", "1kld", "1crr", "2ezs", "2ezr", "1vve", "7ll9_G"]   # These ids are failed to be processed
+
+
+  datasplitter:
+    _target_: "proteinfoundation.datasets.pdb_data.PDBDataSplitter"
+    data_dir: ${oc.env:DATA_PATH}/pdb_train/ # Directory where the dataset is stored
+    train_val_test: [0.98, 0.019, 0.001] # Cross-validation ratios to use for train, val, and test splits
+    split_type: "sequence_similarity" # Split sequences by sequence similarity clustering, other option is "random"
+    split_sequence_similarity: 0.5 # Clustering at 50% sequence similarity (argument is ignored if split_type!="sequence_similarity")
+    overwrite_sequence_clusters: False # Previous clusterings at same sequence similarity are reused and not overwritten (argument is ignored if split_type!="sequence_similarity")
