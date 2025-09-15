@@ -33,7 +33,7 @@ dependencies:
     - pre-commit>=4.0.0
     - joblib==1.4.2
     - rich==14.0.0
-    - deepdiff
+    - deepdiff>=8.6.1
     - multipledispatch
     - plotly
     - pydantic
