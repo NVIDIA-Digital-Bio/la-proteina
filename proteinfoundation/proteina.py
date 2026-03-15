@@ -513,12 +513,29 @@ class Proteina(L.LightningModule):
             List of tuples. Each tuple represents one of the generated samples, has two elements:
                 coordinates tensor of shape [n, 37, 3], and aatype tensor of shape [n].
         """
+        import time
+
         self_cond = self.inf_cfg.args.self_cond
 
         nsteps = self.inf_cfg.args.nsteps
         guidance_w = self.inf_cfg.args.get("guidance_w", 1.0)
         ag_ratio = self.inf_cfg.args.get("ag_ratio", 0.0)
-        save_trajectory_every = 0
+        save_trajectory_every = self.inf_cfg.args.get("save_trajectory_every", 0)
+
+        # Timing and memory tracking
+        is_cuda = self.device.type == "cuda"
+        if is_cuda:
+            torch.cuda.reset_peak_memory_stats(self.device)
+            torch.cuda.synchronize(self.device)
+        t_start = time.time()
+
+        solver = self.inf_cfg.args.get("solver", "euler")
+
+        # Build sampling_model_args; include adaptive config if present
+        sampling_model_args = dict(self.inf_cfg.model)
+        adaptive_cfg = self.inf_cfg.args.get("adaptive", None)
+        if adaptive_cfg is not None:
+            sampling_model_args["adaptive"] = dict(adaptive_cfg)
 
         fn_predict_for_sampling = partial(
             self.predict_for_sampling, n_recycle=self.inf_cfg.get("n_recycle", 0)
@@ -530,12 +547,48 @@ class Proteina(L.LightningModule):
             nsamples=batch["nsamples"],
             n=batch["nres"],
             self_cond=self_cond,
-            sampling_model_args=self.inf_cfg.model,
+            sampling_model_args=sampling_model_args,
             device=self.device,
             save_trajectory_every=save_trajectory_every,
             guidance_w=guidance_w,
             ag_ratio=ag_ratio,
+            solver=solver,
         )
+
+        # Record timing and peak memory
+        if is_cuda:
+            torch.cuda.synchronize(self.device)
+        wall_time_s = time.time() - t_start
+        peak_memory_gb = (
+            torch.cuda.max_memory_allocated(self.device) / 1e9 if is_cuda else 0.0
+        )
+        logger.info(
+            f"predict_step batch {batch_idx}: length={batch['nres']}, nsamples={batch['nsamples']}, "
+            f"nsteps={nsteps}, wall_time={wall_time_s:.1f}s, peak_memory={peak_memory_gb:.2f}GB"
+        )
+        nfe_total = extra_info.get("nfe_total", nsteps * (2 if solver in ("heun", "stochastic_heun") else 1))
+        if not hasattr(self, "_generation_stats"):
+            self._generation_stats = []
+        stats_entry = {
+            "batch_idx": batch_idx,
+            "length": int(batch["nres"]),
+            "nsamples": int(batch["nsamples"]),
+            "nsteps": nsteps,
+            "solver": solver,
+            "nfe_total": nfe_total,
+            "wall_time_s": round(wall_time_s, 2),
+            "peak_memory_gb": round(peak_memory_gb, 3),
+            "device": str(self.device),
+            "use_sdpa": os.environ.get("LP_USE_SDPA", "1") == "1",
+            "use_bf16": os.environ.get("LP_USE_BF16", "1") == "1",
+            "use_compile": os.environ.get("LP_USE_COMPILE", "0") == "1",
+        }
+        if "nsteps_taken" in extra_info:
+            stats_entry["nsteps_taken"] = extra_info["nsteps_taken"]
+        if "nsteps_rejected" in extra_info:
+            stats_entry["nsteps_rejected"] = extra_info["nsteps_rejected"]
+        self._generation_stats.append(stats_entry)
+
         # Dict with the data_modes as keys, and values with batch shape b
         # extra_info is a dict with additional things, including
         # "mask", whose value is boolean of shape [nsamples, n]
@@ -554,7 +607,25 @@ class Proteina(L.LightningModule):
             generation_list.append(
                 (sample_prots["coors"][i], sample_prots["residue_type"][i])
             )  # Tuple (coors [n, 37, 3], aatype [n])
-        return generation_list  # List of tupes (coors [n, 37, 3], aatype [n])
+
+        # Decode trajectory snapshots through the autoencoder if present.
+        trajectory_list = []
+        for snap in extra_info.get("trajectory", []):
+            traj_extra = {**extra_info, "return_logits": save_trajectory_every > 0}
+            traj_prots = self.sample_formatting(
+                x=snap["x"],
+                extra_info=traj_extra,
+                ret_mode="coors37_n_aatype",
+            )
+            step_samples = []
+            for i in range(traj_prots["coors"].shape[0]):
+                sample_data = (traj_prots["coors"][i], traj_prots["residue_type"][i])
+                if "seq_logits" in traj_prots:
+                    sample_data = sample_data + (traj_prots["seq_logits"][i],)
+                step_samples.append(sample_data)
+            trajectory_list.append({"step": snap["step"], "samples": step_samples})
+
+        return generation_list, trajectory_list
 
     def sample_formatting(
         self,
@@ -590,7 +661,8 @@ class Proteina(L.LightningModule):
             )
         elif data_modes == ["bb_ca", "local_latents"]:
             return self._format_sample_local_latents(
-                x=x, ret_mode=ret_mode, mask=extra_info["mask"]
+                x=x, ret_mode=ret_mode, mask=extra_info["mask"],
+                return_logits=extra_info.get("return_logits", False),
             )
         else:
             raise NotImplementedError(f"Format {ret_mode} not implemented")
@@ -655,6 +727,7 @@ class Proteina(L.LightningModule):
         x: Dict[str, torch.Tensor],
         ret_mode: str,
         mask: Bool[torch.Tensor, "b n"],
+        return_logits: bool = False,
     ):
         """
         Given a batch of b samples consisting on `bb_ca` and `local_latents` this
@@ -689,11 +762,14 @@ class Proteina(L.LightningModule):
             return x
 
         elif ret_mode == "coors37_n_aatype":
-            return {
+            result = {
                 "coors": nm_to_ang(output_decoder["coors_nm"]),  # [b, n, 37, 3]
                 "residue_type": output_decoder["residue_type"],  # [b, n]
                 "mask": output_decoder["residue_mask"],  # [b, n]
             }
+            if return_logits and "seq_logits" in output_decoder:
+                result["seq_logits"] = output_decoder["seq_logits"]  # [b, n, 20]
+            return result
 
         elif ret_mode == "pdb_string":
             pdb_strings = []

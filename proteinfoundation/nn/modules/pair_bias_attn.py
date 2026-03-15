@@ -20,11 +20,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import os
 from typing import Optional
 
 import torch
 from einops import rearrange
 from torch import Tensor, einsum, nn
+from torch.nn import functional as F
 
 from proteinfoundation.nn.modules.adaptive_ln_scale import (
     AdaptiveLayerNorm,
@@ -114,7 +116,25 @@ class PairBiasAttention(nn.Module):
         return self.to_out_node(attn_feats)
 
     def _attn(self, q, k, v, b, mask: Optional[Tensor]) -> Tensor:
-        """Perform attention update"""
+        """Perform attention update (dispatches to SDPA or manual implementation)"""
+        if os.environ.get("LP_USE_SDPA", "1") == "1":
+            return self._attn_sdpa(q, k, v, b, mask)
+        return self._attn_manual(q, k, v, b, mask)
+
+    def _attn_sdpa(self, q, k, v, b, mask: Optional[Tensor]) -> Tensor:
+        """Attention via F.scaled_dot_product_attention (fused kernels, lower memory)"""
+        # Combine pair bias and padding mask into a single additive attn_mask
+        attn_bias = b if not isinstance(b, int) else None
+        if exists(mask):
+            mask_bias = torch.zeros(
+                mask.shape[0], 1, mask.shape[1], mask.shape[2],
+                dtype=q.dtype, device=q.device,
+            ).masked_fill(~rearrange(mask, "b i j -> b () i j"), float("-inf"))
+            attn_bias = mask_bias + attn_bias if attn_bias is not None else mask_bias
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
+
+    def _attn_manual(self, q, k, v, b, mask: Optional[Tensor]) -> Tensor:
+        """Original manual attention implementation (fallback)"""
         sim = einsum("b h i d, b h j d -> b h i j", q, k) * self.scale
         if exists(mask):
             mask = rearrange(mask, "b i j -> b () i j")
