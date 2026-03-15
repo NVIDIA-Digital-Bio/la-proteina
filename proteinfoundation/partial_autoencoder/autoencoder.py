@@ -143,12 +143,15 @@ class AutoEncoder(L.LightningModule):
         coors_nm = (
             output_dec["coors_nm"] * mask[..., None, None] * atom_mask[..., None]
         )  # [b, n, 37, 3]
-        return {
+        result = {
             "coors_nm": coors_nm,
             "residue_type": output_dec["aatype_max"] * mask,
             "residue_mask": mask,
             "atom_mask": atom_mask,
         }
+        if "seq_logits" in output_dec:
+            result["seq_logits"] = output_dec["seq_logits"]  # [b, n, 20]
+        return result
 
     def training_step(self, batch: Dict, batch_idx: int):
         """

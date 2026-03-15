@@ -1,0 +1,13 @@
+defaults:
+  - inference_ucond_notri
+  - _self_
+
+run_name_: laproteina_ucond_notri_ode
+generation:
+  model:
+    bb_ca:
+      simulation_step_params:
+        sampling_mode: vf
+    local_latents:
+      simulation_step_params:
+        sampling_mode: vf

@@ -1,0 +1,9 @@
+defaults:
+  - inference_ucond_notri_ode
+  - _self_
+
+run_name_: laproteina_ucond_notri_heun
+generation:
+  args:
+    solver: heun
+    nsteps: 100

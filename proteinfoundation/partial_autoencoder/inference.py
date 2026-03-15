@@ -69,6 +69,11 @@ def parse_args_and_cfg() -> Tuple[Dict, Dict, str]:
         help="(Optional) Name of directory with config files, if not included uses base inference config.\
             Likely only used when submitting to the cluster with script.",
     )
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="Run on CPU only (slow, for development/testing without GPU)",
+    )
     args = parser.parse_args()
 
     # Inference config
@@ -101,6 +106,7 @@ def setup(
     cfg: Dict,
     config_name: str,
     create_root: bool = True,
+    cpu_mode: bool = False,
 ) -> str:
     """
     Checks if metrics being computed are compatible, sets the right seed, and creates the root directory
@@ -111,9 +117,12 @@ def setup(
     """
     logger.info(" ".join(sys.argv))
 
-    assert (
-        torch.cuda.is_available()
-    ), "CUDA not available"  # Needed for ESMfold and designability
+    if cpu_mode:
+        logger.warning("Running in CPU mode - this will be slow!")
+    else:
+        assert (
+            torch.cuda.is_available()
+        ), "CUDA not available. Use --cpu flag to run on CPU (slow)."
     logger.add(
         sys.stdout,
         format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {file}:{line} | {message}",
@@ -243,7 +252,7 @@ def main() -> None:
     ae_name, ckpt_name = extract_ckpt_info(cfg.ckpt_file)
 
     # Some setup
-    root_path = setup(cfg, create_root=True, config_name=config_name)
+    root_path = setup(cfg, create_root=True, config_name=config_name, cpu_mode=args.cpu)
     df_file_store = os.path.join(root_path, f"../results_{config_name}.csv")
     df_file_store_summary = os.path.join(
         root_path, f"../results_{config_name}_summary.csv"
@@ -256,8 +265,9 @@ def main() -> None:
     model = AutoEncoder.load_from_checkpoint(cfg.ckpt_file)
 
     # Make predictions, store them together with inputs
+    accelerator = "cpu" if args.cpu else "gpu"
     trainer = L.Trainer(
-        accelerator="gpu", devices=1, limit_predict_batches=int(cfg.n_structs / cfg.bs)
+        accelerator=accelerator, devices=1, limit_predict_batches=int(cfg.n_structs / cfg.bs)
     )
     predictions = trainer.predict(model, dataloader)
     # List of tuples, each tuple is (data_batch, predicted_batch)

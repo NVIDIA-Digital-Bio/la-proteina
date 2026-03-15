@@ -61,6 +61,31 @@ def create_individual_fasta_files(
     return output_dir
 
 
+def load_esmfold(cache_dir: Optional[str] = None):
+    """Load ESMFold model and tokenizer once, for reuse across multiple calls.
+
+    Args:
+        cache_dir: Cache directory for model weights.
+
+    Returns:
+        Tuple of (esm_model, tokenizer).
+    """
+    is_cluster_run = os.environ.get("SLURM_JOB_ID") is not None
+
+    final_cache_dir = cache_dir
+    if final_cache_dir is None and is_cluster_run:
+        final_cache_dir = os.environ.get("CACHE_DIR")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        "facebook/esmfold_v1", cache_dir=final_cache_dir
+    )
+    esm_model = EsmForProteinFolding.from_pretrained(
+        "facebook/esmfold_v1", cache_dir=final_cache_dir
+    )
+    esm_model = esm_model.cuda()
+    return esm_model, tokenizer
+
+
 def run_esmfold(
     sequences: List[str],
     path_to_esmfold_out: str,
@@ -68,6 +93,8 @@ def run_esmfold(
     suffix: str,
     cache_dir: Optional[str] = None,
     keep_outputs: bool = False,
+    esm_model: Optional[EsmForProteinFolding] = None,
+    tokenizer: Optional[AutoTokenizer] = None,
 ) -> List[str]:
     """
     Runs ESMFold on sequences and stores results as PDB files.
@@ -82,24 +109,14 @@ def run_esmfold(
         suffix: to use as suffix when storing files
         cache_dir: Cache directory for model weights
         keep_outputs: Whether to keep output directories
+        esm_model: Pre-loaded ESMFold model (if None, loads fresh)
+        tokenizer: Pre-loaded tokenizer (if None, loads fresh)
 
     Returns:
         List of paths (list of str) to PDB files
     """
-    is_cluster_run = os.environ.get("SLURM_JOB_ID") is not None
-
-    # Use provided cache_dir or fallback to environment/cluster logic
-    final_cache_dir = cache_dir
-    if final_cache_dir is None and is_cluster_run:
-        final_cache_dir = os.environ.get("CACHE_DIR")
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        "facebook/esmfold_v1", cache_dir=final_cache_dir
-    )
-    esm_model = EsmForProteinFolding.from_pretrained(
-        "facebook/esmfold_v1", cache_dir=final_cache_dir
-    )
-    esm_model = esm_model.cuda()
+    if esm_model is None or tokenizer is None:
+        esm_model, tokenizer = load_esmfold(cache_dir)
 
     # Run ESMFold
     list_of_strings_pdb = []
