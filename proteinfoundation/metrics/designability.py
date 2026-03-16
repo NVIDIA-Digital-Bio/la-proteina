@@ -14,7 +14,7 @@ from torch import Tensor
 from transformers import logging as hf_logging
 
 from openfold.np import residue_constants
-from proteinfoundation.metrics.folding_models import run_esmfold
+from proteinfoundation.metrics.folding_models import load_esmfold, run_esmfold
 from proteinfoundation.utils.align_utils import kabsch_align_ind
 from proteinfoundation.utils.coors_utils import (
     get_atom37_bb3_mask,
@@ -311,6 +311,7 @@ def scRMSD(
     # cache_dir: Optional[str] = "/lustre/fsw/portfolios/nvr/users/kdidi/.cache",
     cache_dir: Optional[str] = None,
     keep_outputs: bool = False,
+    preloaded_esmfold: Optional[tuple] = None,
 ) -> Dict[str, Union[float, List[float]]]:
     """
     Evaluates self-consistency RMSD metrics for given pdb.
@@ -401,8 +402,13 @@ def scRMSD(
         os.makedirs(model_tmp_path, exist_ok=True)
 
         if model == "esmfold":
+            esm_model = None
+            esm_tokenizer = None
+            if preloaded_esmfold is not None:
+                esm_model, esm_tokenizer = preloaded_esmfold
             out_folding_paths = run_esmfold(
-                gen_seqs, model_tmp_path, name, suffix=suffix, cache_dir=cache_dir, keep_outputs=keep_outputs
+                gen_seqs, model_tmp_path, name, suffix=suffix, cache_dir=cache_dir, keep_outputs=keep_outputs,
+                esm_model=esm_model, tokenizer=esm_tokenizer,
             )
         elif model == "colabfold":
             out_folding_paths = run_colabfold(

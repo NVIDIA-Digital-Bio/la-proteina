@@ -3,6 +3,7 @@ __pycache__/
 lightning_logs
 
 .DS_Store
+**/.DS_Store
 
 .vscode/
 .env
@@ -27,3 +28,11 @@ wandb/
 /inference
 /ProteinMPNN/ca_model_weights/*.pt
 /ProteinMPNN/vanilla_model_weights/*.pt
+
+# Experiment logs
+experiments.csv
+
+# Terraform
+infra/terraform/.terraform/
+infra/terraform/terraform.tfstate*
+infra/terraform/*.tfvars

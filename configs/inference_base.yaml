@@ -17,6 +17,7 @@ generation:
   args:
     nsteps: 400
     self_cond: True
+    solver: euler  # "euler", "heun" (ODE), "adaptive_heun" (ODE adaptive), or "stochastic_heun" (SDE 2nd order)
 
     # Guidance
     guidance_w: 1.0   # guidance model weights, 1.0 for w/o CFG and autoguidance, 0.0 for excluding the main model
@@ -24,6 +25,15 @@ generation:
     ag_ckpt_path: null  # path to bad model checkpoint
 
     save_trajectory_every: 0 # at which step interval to save trajectory snapshots of generation, 0 for no saving
+
+    # Adaptive step sizing (used when solver: adaptive_heun)
+    adaptive:
+      atol: 1.0e-3
+      rtol: 1.0e-2
+      dt_init: 0.01
+      dt_min: 1.0e-4
+      dt_max: 0.1
+      safety_factor: 0.9
 
   # Model-specific sampling arguments
   model:

@@ -411,6 +411,93 @@ class RDNFlowMatcher(BaseFlowMatcher):
         return x_next
 
 
+    def compute_drift_and_diffusion_coeff(
+        self,
+        x_t: Float[Tensor, "* n d"],
+        v: Float[Tensor, "* n d"],
+        t: Float[Tensor, "*"],
+        gt: float,
+        simulation_step_params: Dict,
+    ) -> Tuple[Float[Tensor, "* n d"], float]:
+        """
+        Decomposes the SDE step into drift and diffusion coefficient.
+
+        For the SDE: dx = drift(x,t) dt + diffusion_coeff(t) dW
+
+        This mirrors the logic of simulation_step but returns the drift and
+        diffusion coefficient separately (needed for higher-order SDE solvers
+        like stochastic Heun).
+
+        Args:
+            x_t: Current value, shape [*, n, d]
+            v: Velocity field (already guided if guidance is active), shape [*, n, d]
+            t: Current time, shape [*]
+            gt: Noise injection schedule value, float or 0-dim tensor
+            simulation_step_params: Parameters dict with sampling_mode, scales, etc.
+
+        Returns:
+            drift: Tensor same shape as x_t (what multiplies dt)
+            diffusion_coeff: float or 0-dim tensor (sigma; noise std is sigma * sqrt(dt) * eps)
+        """
+        sampling_mode = simulation_step_params["sampling_mode"]
+        sc_scale_noise = simulation_step_params["sc_scale_noise"]
+        sc_scale_score = simulation_step_params["sc_scale_score"]
+        t_lim_ode = simulation_step_params["t_lim_ode"]
+        t_lim_ode_below = simulation_step_params["t_lim_ode_below"]
+        t_element = t.flatten()[0]
+
+        sc_scale_score_def = 1.5
+        sc_scale_noise_def = 0.3
+
+        # Clamp t for vf_to_score/score_to_vf safety (they assert strict bounds)
+        t_safe = torch.clamp(t, min=1e-5, max=1.0 - 1e-5)
+
+        if sampling_mode == "vf":
+            return v, 0.0
+
+        elif sampling_mode == "sc":
+            if t_element > t_lim_ode:
+                score = vf_to_score(x_t, v, t_safe)
+                v_scaled = score_to_vf(x_t, score * sc_scale_score_def, t_safe)
+                return v_scaled, 0.0
+            else:
+                score = vf_to_score(x_t, v, t_safe)
+                drift = v + gt * score
+                diffusion_coeff = (2.0 * gt * sc_scale_noise) ** 0.5
+                return drift, diffusion_coeff
+
+        elif sampling_mode == "vf_ss":
+            if t_element < t_lim_ode_below:
+                score = vf_to_score(x_t, v, t_safe)
+                drift = v + gt * score
+                diffusion_coeff = (2.0 * gt * sc_scale_noise_def) ** 0.5
+                return drift, diffusion_coeff
+            else:
+                score = vf_to_score(x_t, v, t_safe)
+                v_scaled = score_to_vf(x_t, score * sc_scale_score, t_safe)
+                return v_scaled, 0.0
+
+        elif sampling_mode == "vf_ss_sc_sn":
+            if t_element > t_lim_ode:
+                score = vf_to_score(x_t, v, t_safe)
+                v_scaled = score_to_vf(x_t, score * sc_scale_score_def, t_safe)
+                return v_scaled, 0.0
+            elif t_element < t_lim_ode_below:
+                score = vf_to_score(x_t, v, t_safe)
+                drift = v + gt * score
+                diffusion_coeff = (2.0 * gt * sc_scale_noise_def) ** 0.5
+                return drift, diffusion_coeff
+            else:
+                score = vf_to_score(x_t, v, t_safe)
+                v_scaled = score_to_vf(x_t, score * sc_scale_score, t_safe)
+                drift = v_scaled + gt * score
+                diffusion_coeff = (2.0 * gt * sc_scale_noise) ** 0.5
+                return drift, diffusion_coeff
+
+        else:
+            raise ValueError(f"Invalid sampling mode {sampling_mode}")
+
+
 def vf_to_score(
     x_t: Float[Tensor, "* n d"],
     v: Float[Tensor, "* n d"],

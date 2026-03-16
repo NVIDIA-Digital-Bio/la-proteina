@@ -1,0 +1,9 @@
+defaults:
+  - inference_ucond_notri
+  - _self_
+
+run_name_: laproteina_ucond_notri_stochastic_heun
+generation:
+  args:
+    solver: stochastic_heun
+    nsteps: 100

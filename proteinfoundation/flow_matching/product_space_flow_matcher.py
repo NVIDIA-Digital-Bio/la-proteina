@@ -1,8 +1,10 @@
+import os
 from typing import Callable, Dict, Optional, Tuple, Union
 
 import lightning as L
 import torch
 from jaxtyping import Bool, Float
+from loguru import logger
 from torch import Tensor
 
 from proteinfoundation.flow_matching.rdn_flow_matcher import RDNFlowMatcher
@@ -502,6 +504,279 @@ class ProductSpaceFlowMatcher(L.LightningModule):
         )  # Adds guided tensor used for simulation ("guided_v", "guided_score", or whatever the base flow matcher uses)
         return nn_out
 
+    def adaptive_heun_simulation(
+        self,
+        batch: Dict,
+        predict_for_sampling: Callable,
+        max_nfe: int,
+        nsamples: int,
+        n: int,
+        self_cond: bool,
+        sampling_model_args: Dict[str, Dict],
+        device: torch.device,
+        save_trajectory_every: int = 0,
+        guidance_w: float = 1.0,
+        ag_ratio: float = 0.0,
+        atol: float = 1e-3,
+        rtol: float = 1e-2,
+        dt_init: float = 0.01,
+        dt_min: float = 1e-4,
+        dt_max: float = 0.1,
+        safety_factor: float = 0.9,
+    ) -> Tuple[Dict[str, Tensor], Dict]:
+        """
+        Adaptive Heun-Euler embedded method for ODE integration from t=0 to t=1.
+
+        Uses the Heun method (trapezoidal rule) for stepping and the difference
+        between the Euler trial and Heun-corrected steps as a free local
+        truncation error estimate. Step size is adjusted based on the error
+        ratio, with steps rejected when the error exceeds tolerance.
+
+        All samples in a batch share the same adaptive schedule (max error
+        across samples drives acceptance/rejection).
+
+        Args:
+            batch: Input batch dict.
+            predict_for_sampling: Callable that runs the neural network.
+            max_nfe: Maximum number of function evaluations (NFE budget).
+            nsamples: Number of samples to generate.
+            n: Protein length.
+            self_cond: Whether to use self-conditioning.
+            sampling_model_args: Model-specific sampling arguments.
+            device: Torch device.
+            save_trajectory_every: Save trajectory at NFE milestones (0 to disable).
+            guidance_w: Guidance weight.
+            ag_ratio: Autoguidance ratio.
+            atol: Absolute error tolerance.
+            rtol: Relative error tolerance.
+            dt_init: Initial step size.
+            dt_min: Minimum step size.
+            dt_max: Maximum step size.
+            safety_factor: Safety factor for step size adjustment.
+
+        Returns:
+            x: Generated samples dict.
+            additional_info: Dict with mask, trajectory, solver info, NFE counts.
+        """
+        # Squeeze batch-dim-1 tensors (same as full_simulation)
+        for key, value in batch.items():
+            if (
+                isinstance(value, torch.Tensor)
+                and value.dim() > 0
+                and value.size(0) == 1
+            ):
+                batch[key] = value.squeeze(0)
+
+        # Use mask from batch if present, otherwise generate it
+        if "mask" in batch and batch["mask"] is not None:
+            mask = batch["mask"]
+        else:
+            mask = torch.ones(nsamples, n).long().bool().to(device)
+        assert mask.shape == (nsamples, n)
+
+        trajectory = []
+
+        with torch.no_grad():
+            use_bf16 = os.environ.get("LP_USE_BF16", "1") == "1" and device.type == "cuda"
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                x = self.sample_noise(
+                    n,
+                    shape=(nsamples,),
+                    device=device,
+                    mask=mask,
+                )
+
+                t = 0.0
+                dt = dt_init
+                nfe_used = 0
+                steps_accepted = 0
+                steps_rejected = 0
+                x_1_pred = None  # for self-conditioning
+
+                while t < 1.0 and nfe_used + 2 <= max_nfe:
+                    dt = min(dt, 1.0 - t)
+
+                    # --- First NN evaluation at (x, t) ---
+                    t_tensor = {
+                        dm: t * torch.ones(nsamples, device=device)
+                        for dm in self.data_modes
+                    }
+                    batch["x_t"] = x
+                    batch["t"] = t_tensor
+                    batch["mask"] = mask
+
+                    if steps_accepted > 0 and self_cond and x_1_pred is not None:
+                        batch["x_sc"] = x_1_pred
+
+                    nn_out_1 = self.get_clean_pred_n_guided_vector(
+                        batch=batch,
+                        predict_for_sampling=predict_for_sampling,
+                        guidance_w=guidance_w,
+                        ag_ratio=ag_ratio,
+                    )
+                    nfe_used += 1
+
+                    v1 = {}
+                    for dm in self.data_modes:
+                        v1[dm] = nn_out_1[dm].get("v_guided", nn_out_1[dm]["v"])
+
+                    x_1_pred_1 = self.nn_out_to_clean_sample_prediction(
+                        batch=batch, nn_out=nn_out_1
+                    )
+
+                    # --- Trial Euler step ---
+                    x_trial = {dm: x[dm] + v1[dm] * dt for dm in self.data_modes}
+                    x_trial = self._apply_mask(x_trial, mask)
+                    for dm in self.data_modes:
+                        if sampling_model_args[dm]["simulation_step_params"].get("center_every_step", False):
+                            x_trial[dm] = self.base_flow_matchers[dm]._force_zero_com(x_trial[dm], mask)
+
+                    # --- Second NN evaluation at (x_trial, t + dt) ---
+                    t_trial_tensor = {
+                        dm: (t + dt) * torch.ones(nsamples, device=device)
+                        for dm in self.data_modes
+                    }
+                    batch["x_t"] = x_trial
+                    batch["t"] = t_trial_tensor
+                    if self_cond:
+                        batch["x_sc"] = x_1_pred_1
+
+                    nn_out_2 = self.get_clean_pred_n_guided_vector(
+                        batch=batch,
+                        predict_for_sampling=predict_for_sampling,
+                        guidance_w=guidance_w,
+                        ag_ratio=ag_ratio,
+                    )
+                    nfe_used += 1
+
+                    v2 = {}
+                    for dm in self.data_modes:
+                        v2[dm] = nn_out_2[dm].get("v_guided", nn_out_2[dm]["v"])
+
+                    # --- Error estimate ---
+                    # err = 0.5 * (v2 - v1) * dt  (local truncation error of Euler)
+                    err_ratio = 0.0
+                    for dm in self.data_modes:
+                        err_dm = 0.5 * (v2[dm] - v1[dm]) * dt
+                        x_scale = atol + rtol * torch.max(
+                            torch.abs(x[dm]), torch.abs(x_trial[dm])
+                        )
+                        scaled = err_dm / x_scale  # [b, n, d]
+                        nres = mask.sum(dim=-1)  # [b]
+                        d = scaled.shape[-1]
+                        per_sample = torch.sqrt(
+                            (scaled**2 * mask[..., None]).sum(dim=(-1, -2)) / (nres * d)
+                        )  # [b]
+                        err_ratio = max(err_ratio, per_sample.max().item())
+
+                    if err_ratio <= 1.0:
+                        # Accept step: Heun update
+                        x = {
+                            dm: x[dm] + 0.5 * (v1[dm] + v2[dm]) * dt
+                            for dm in self.data_modes
+                        }
+                        x = self._apply_mask(x, mask)
+                        for dm in self.data_modes:
+                            if sampling_model_args[dm]["simulation_step_params"].get("center_every_step", False):
+                                x[dm] = self.base_flow_matchers[dm]._force_zero_com(x[dm], mask)
+
+                        t += dt
+                        steps_accepted += 1
+
+                        # Update x_1_pred from second (better) eval for self-conditioning
+                        x_1_pred = self.nn_out_to_clean_sample_prediction(
+                            batch=batch, nn_out=nn_out_2
+                        )
+
+                        # Save trajectory at NFE milestones
+                        if save_trajectory_every > 0 and nfe_used % save_trajectory_every == 0:
+                            trajectory.append({
+                                "step": nfe_used,
+                                "x": {k: v.detach().clone() for k, v in x.items()},
+                            })
+                    else:
+                        steps_rejected += 1
+                        # On rejection: x_1_pred stays from last accepted step
+
+                    # --- Adjust dt ---
+                    if err_ratio > 0:
+                        dt *= safety_factor * (1.0 / err_ratio) ** 0.5
+                    else:
+                        dt *= 2.0  # error is zero; double the step
+                    dt = max(dt_min, min(dt, dt_max))
+
+                # If t < 1.0 and budget exhausted, do one final forced Heun step
+                if t < 1.0 and nfe_used + 2 <= max_nfe + 2:
+                    dt_final = 1.0 - t
+                    t_tensor = {
+                        dm: t * torch.ones(nsamples, device=device)
+                        for dm in self.data_modes
+                    }
+                    batch["x_t"] = x
+                    batch["t"] = t_tensor
+                    batch["mask"] = mask
+                    if self_cond and x_1_pred is not None:
+                        batch["x_sc"] = x_1_pred
+
+                    nn_out_1 = self.get_clean_pred_n_guided_vector(
+                        batch=batch,
+                        predict_for_sampling=predict_for_sampling,
+                        guidance_w=guidance_w,
+                        ag_ratio=ag_ratio,
+                    )
+                    nfe_used += 1
+                    v1 = {dm: nn_out_1[dm].get("v_guided", nn_out_1[dm]["v"]) for dm in self.data_modes}
+                    x_1_pred_1 = self.nn_out_to_clean_sample_prediction(batch=batch, nn_out=nn_out_1)
+
+                    x_trial = {dm: x[dm] + v1[dm] * dt_final for dm in self.data_modes}
+                    x_trial = self._apply_mask(x_trial, mask)
+                    for dm in self.data_modes:
+                        if sampling_model_args[dm]["simulation_step_params"].get("center_every_step", False):
+                            x_trial[dm] = self.base_flow_matchers[dm]._force_zero_com(x_trial[dm], mask)
+
+                    t_trial_tensor = {
+                        dm: 1.0 * torch.ones(nsamples, device=device)
+                        for dm in self.data_modes
+                    }
+                    batch["x_t"] = x_trial
+                    batch["t"] = t_trial_tensor
+                    if self_cond:
+                        batch["x_sc"] = x_1_pred_1
+
+                    nn_out_2 = self.get_clean_pred_n_guided_vector(
+                        batch=batch,
+                        predict_for_sampling=predict_for_sampling,
+                        guidance_w=guidance_w,
+                        ag_ratio=ag_ratio,
+                    )
+                    nfe_used += 1
+                    v2 = {dm: nn_out_2[dm].get("v_guided", nn_out_2[dm]["v"]) for dm in self.data_modes}
+
+                    x = {dm: x[dm] + 0.5 * (v1[dm] + v2[dm]) * dt_final for dm in self.data_modes}
+                    x = self._apply_mask(x, mask)
+                    for dm in self.data_modes:
+                        if sampling_model_args[dm]["simulation_step_params"].get("center_every_step", False):
+                            x[dm] = self.base_flow_matchers[dm]._force_zero_com(x[dm], mask)
+
+                    t += dt_final
+                    steps_accepted += 1
+                    x_1_pred = self.nn_out_to_clean_sample_prediction(batch=batch, nn_out=nn_out_2)
+
+                logger.info(
+                    f"Adaptive Heun: t_final={t:.6f}, NFEs={nfe_used}/{max_nfe}, "
+                    f"steps_accepted={steps_accepted}, steps_rejected={steps_rejected}"
+                )
+
+        additional_info = {
+            "mask": mask,
+            "trajectory": trajectory,
+            "solver": "adaptive_heun",
+            "nfe_total": nfe_used,
+            "nsteps_taken": steps_accepted,
+            "nsteps_rejected": steps_rejected,
+        }
+        return x, additional_info
+
     def full_simulation(
         self,
         batch: Dict,
@@ -515,6 +790,7 @@ class ProductSpaceFlowMatcher(L.LightningModule):
         save_trajectory_every: int = 0,
         guidance_w: float = 1.0,
         ag_ratio: float = 0.0,
+        solver: str = "euler",
     ) -> Dict[str, Tensor]:
         """
         Generates samples by simulating the
@@ -572,9 +848,32 @@ class ProductSpaceFlowMatcher(L.LightningModule):
             mask = torch.ones(nsamples, n).long().bool().to(device)
         assert mask.shape == (nsamples, n)
         
-        if save_trajectory_every > 0:
-            # Create a list of trajectory dictionaries, one for each sample in batch
-            [{} for _ in range(nsamples)]
+        assert solver in ("euler", "heun", "adaptive_heun", "stochastic_heun"), f"Unknown solver: {solver}"
+        if solver in ("heun", "adaptive_heun"):
+            for dm in self.data_modes:
+                mode = sampling_model_args[dm]["simulation_step_params"]["sampling_mode"]
+                assert mode == "vf", (
+                    f"{solver} requires sampling_mode='vf' (ODE), but {dm} has '{mode}'"
+                )
+
+        if solver == "adaptive_heun":
+            adaptive_cfg = sampling_model_args.get("adaptive", {})
+            return self.adaptive_heun_simulation(
+                batch=batch,
+                predict_for_sampling=predict_for_sampling,
+                max_nfe=nsteps * 2,
+                nsamples=nsamples,
+                n=n,
+                self_cond=self_cond,
+                sampling_model_args=sampling_model_args,
+                device=device,
+                save_trajectory_every=save_trajectory_every,
+                guidance_w=guidance_w,
+                ag_ratio=ag_ratio,
+                **adaptive_cfg,
+            )
+
+        trajectory = []
 
         ts = {
             data_mode: get_schedule(
@@ -595,69 +894,205 @@ class ProductSpaceFlowMatcher(L.LightningModule):
             for data_mode in self.data_modes
         }
 
+        # Stochastic Heun needs gt at the trial points (t+dt) for drift computation
+        if solver == "stochastic_heun":
+            gt_trial = {
+                data_mode: get_gt(
+                    t=ts[data_mode][1:],  # [nsteps], gt at trial endpoints
+                    mode=sampling_model_args[data_mode]["gt"]["mode"],
+                    param=sampling_model_args[data_mode]["gt"]["p"],
+                    clamp_val=sampling_model_args[data_mode]["gt"]["clamp_val"],
+                )
+                for data_mode in self.data_modes
+            }
+
         with torch.no_grad():
-            x = self.sample_noise(
-                n,
-                shape=(nsamples,),
-                device=device,
-                mask=mask,
-            )
-
-            for step in range(nsteps):
-                t = {
-                    data_mode: ts[data_mode][step] * torch.ones(nsamples, device=device)
-                    for data_mode in self.data_modes
-                }
-                dt = {
-                    data_mode: ts[data_mode][step + 1] - ts[data_mode][step]
-                    for data_mode in self.data_modes
-                }
-                gt_step = {
-                    data_mode: gt[data_mode][step] for data_mode in self.data_modes
-                }
-
-                # Update the batch with current x, t, mask, etc.
-                batch["x_t"] = x
-                batch["t"] = t
-                batch["mask"] = mask
-                
-                # self conditioning
-                if step > 0 and self_cond:
-                    batch["x_sc"] = x_1_pred
-
-                # get clean prediction and guided vector
-                nn_out = self.get_clean_pred_n_guided_vector(
-                    batch=batch,
-                    predict_for_sampling=predict_for_sampling,
-                    guidance_w=guidance_w,
-                    ag_ratio=ag_ratio,
-                )
-                # Dict[data_mode,
-                #   Dict[str, torch.Tensor]
-                # ] where str is some prediction ("x_1", "v", "score", "guided_v", "guided_score", ...)
-                # We just track all predictions this way
-
-                x_1_pred = self.nn_out_to_clean_sample_prediction(
-                    batch=batch, nn_out=nn_out
-                )
-                # Dict[data_mode, torch.Tensor]
-
-                simulation_step_params = {
-                    data_mode: sampling_model_args[data_mode]["simulation_step_params"]
-                    for data_mode in self.data_modes
-                }
-                x = self.simulation_step(
-                    x_t=x,
-                    nn_out=nn_out,
-                    t=t,
-                    dt=dt,
-                    gt=gt_step,
+            use_bf16 = os.environ.get("LP_USE_BF16", "1") == "1" and device.type == "cuda"
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                x = self.sample_noise(
+                    n,
+                    shape=(nsamples,),
+                    device=device,
                     mask=mask,
-                    simulation_step_params=simulation_step_params,
                 )
+
+                for step in range(nsteps):
+                    t = {
+                        data_mode: ts[data_mode][step] * torch.ones(nsamples, device=device)
+                        for data_mode in self.data_modes
+                    }
+                    dt = {
+                        data_mode: ts[data_mode][step + 1] - ts[data_mode][step]
+                        for data_mode in self.data_modes
+                    }
+                    gt_step = {
+                        data_mode: gt[data_mode][step] for data_mode in self.data_modes
+                    }
+
+                    # Update the batch with current x, t, mask, etc.
+                    batch["x_t"] = x
+                    batch["t"] = t
+                    batch["mask"] = mask
+
+                    # self conditioning
+                    if step > 0 and self_cond:
+                        batch["x_sc"] = x_1_pred
+
+                    # get clean prediction and guided vector
+                    nn_out = self.get_clean_pred_n_guided_vector(
+                        batch=batch,
+                        predict_for_sampling=predict_for_sampling,
+                        guidance_w=guidance_w,
+                        ag_ratio=ag_ratio,
+                    )
+                    # Dict[data_mode,
+                    #   Dict[str, torch.Tensor]
+                    # ] where str is some prediction ("x_1", "v", "score", "guided_v", "guided_score", ...)
+                    # We just track all predictions this way
+
+                    x_1_pred = self.nn_out_to_clean_sample_prediction(
+                        batch=batch, nn_out=nn_out
+                    )
+                    # Dict[data_mode, torch.Tensor]
+
+                    if solver == "heun":
+                        # Extract v1 from first evaluation
+                        v1 = {}
+                        for dm in self.data_modes:
+                            v1[dm] = nn_out[dm].get("v_guided", nn_out[dm]["v"])
+
+                        # Trial Euler step
+                        x_trial = {dm: x[dm] + v1[dm] * dt[dm] for dm in self.data_modes}
+                        x_trial = self._apply_mask(x_trial, mask)
+                        for dm in self.data_modes:
+                            if sampling_model_args[dm]["simulation_step_params"].get("center_every_step", False):
+                                x_trial[dm] = self.base_flow_matchers[dm]._force_zero_com(x_trial[dm], mask)
+
+                        # Second NN eval at trial point (x_trial, t+dt)
+                        t_trial = {
+                            dm: ts[dm][step + 1] * torch.ones(nsamples, device=device)
+                            for dm in self.data_modes
+                        }
+                        batch["x_t"] = x_trial
+                        batch["t"] = t_trial
+                        if self_cond:
+                            batch["x_sc"] = x_1_pred  # use first eval's prediction
+
+                        nn_out_2 = self.get_clean_pred_n_guided_vector(
+                            batch=batch,
+                            predict_for_sampling=predict_for_sampling,
+                            guidance_w=guidance_w,
+                            ag_ratio=ag_ratio,
+                        )
+
+                        # Extract v2 and apply Heun correction
+                        v2 = {}
+                        for dm in self.data_modes:
+                            v2[dm] = nn_out_2[dm].get("v_guided", nn_out_2[dm]["v"])
+
+                        x = {dm: x[dm] + 0.5 * (v1[dm] + v2[dm]) * dt[dm] for dm in self.data_modes}
+                        x = self._apply_mask(x, mask)
+                        for dm in self.data_modes:
+                            if sampling_model_args[dm]["simulation_step_params"].get("center_every_step", False):
+                                x[dm] = self.base_flow_matchers[dm]._force_zero_com(x[dm], mask)
+
+                        # Update x_1_pred from second (better) eval for next step's self-conditioning
+                        x_1_pred = self.nn_out_to_clean_sample_prediction(
+                            batch=batch, nn_out=nn_out_2
+                        )
+
+                    elif solver == "stochastic_heun":
+                        # Stochastic Heun: trapezoidal correction on drift,
+                        # same Brownian increment for trial and final steps.
+                        v1 = {dm: nn_out[dm].get("v_guided", nn_out[dm]["v"]) for dm in self.data_modes}
+
+                        # Compute drift and diffusion at (x, t)
+                        drift1 = {}
+                        noise_term = {}
+                        for dm in self.data_modes:
+                            params = sampling_model_args[dm]["simulation_step_params"]
+                            d1, dc1 = self.base_flow_matchers[dm].compute_drift_and_diffusion_coeff(
+                                x[dm], v1[dm], t[dm], gt_step[dm], params
+                            )
+                            drift1[dm] = d1
+                            eps_dm = torch.randn_like(x[dm])
+                            noise_term[dm] = dc1 * torch.sqrt(dt[dm]) * eps_dm
+
+                        # Trial Euler-Maruyama step (drift + same noise)
+                        x_trial = {dm: x[dm] + drift1[dm] * dt[dm] + noise_term[dm] for dm in self.data_modes}
+                        x_trial = self._apply_mask(x_trial, mask)
+                        for dm in self.data_modes:
+                            if sampling_model_args[dm]["simulation_step_params"].get("center_every_step", False):
+                                x_trial[dm] = self.base_flow_matchers[dm]._force_zero_com(x_trial[dm], mask)
+
+                        # Second NN eval at trial point (x_trial, t+dt)
+                        t_trial = {
+                            dm: ts[dm][step + 1] * torch.ones(nsamples, device=device)
+                            for dm in self.data_modes
+                        }
+                        batch["x_t"] = x_trial
+                        batch["t"] = t_trial
+                        if self_cond:
+                            batch["x_sc"] = x_1_pred
+
+                        nn_out_2 = self.get_clean_pred_n_guided_vector(
+                            batch=batch,
+                            predict_for_sampling=predict_for_sampling,
+                            guidance_w=guidance_w,
+                            ag_ratio=ag_ratio,
+                        )
+
+                        # Compute drift at trial point
+                        v2 = {dm: nn_out_2[dm].get("v_guided", nn_out_2[dm]["v"]) for dm in self.data_modes}
+                        drift2 = {}
+                        for dm in self.data_modes:
+                            params = sampling_model_args[dm]["simulation_step_params"]
+                            d2, _ = self.base_flow_matchers[dm].compute_drift_and_diffusion_coeff(
+                                x_trial[dm], v2[dm], t_trial[dm], gt_trial[dm][step], params
+                            )
+                            drift2[dm] = d2
+
+                        # Stochastic Heun update: trapezoidal on drift, same noise realization
+                        x = {
+                            dm: x[dm] + 0.5 * (drift1[dm] + drift2[dm]) * dt[dm] + noise_term[dm]
+                            for dm in self.data_modes
+                        }
+                        x = self._apply_mask(x, mask)
+                        for dm in self.data_modes:
+                            if sampling_model_args[dm]["simulation_step_params"].get("center_every_step", False):
+                                x[dm] = self.base_flow_matchers[dm]._force_zero_com(x[dm], mask)
+
+                        x_1_pred = self.nn_out_to_clean_sample_prediction(
+                            batch=batch, nn_out=nn_out_2
+                        )
+
+                    else:
+                        # Existing Euler path
+                        simulation_step_params = {
+                            data_mode: sampling_model_args[data_mode]["simulation_step_params"]
+                            for data_mode in self.data_modes
+                        }
+                        x = self.simulation_step(
+                            x_t=x,
+                            nn_out=nn_out,
+                            t=t,
+                            dt=dt,
+                            gt=gt_step,
+                            mask=mask,
+                            simulation_step_params=simulation_step_params,
+                        )
+
+                    if save_trajectory_every > 0 and (step + 1) % save_trajectory_every == 0:
+                        trajectory.append({
+                            "step": step + 1,
+                            "x": {k: v.detach().clone() for k, v in x.items()},
+                        })
 
             additional_info = {
                 "mask": mask,
+                "trajectory": trajectory,
+                "solver": solver,
+                "nfe_total": nsteps * (2 if solver in ("heun", "stochastic_heun") else 1),
             }
             return x, additional_info
 

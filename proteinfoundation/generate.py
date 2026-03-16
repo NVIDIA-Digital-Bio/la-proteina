@@ -61,9 +61,62 @@ def parse_args_and_cfg() -> Tuple[Dict, Dict, str]:
         type=str,
         help="Name of the data path",
     )
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="Run on CPU only (slow, for development/testing without GPU)",
+    )
+    parser.add_argument(
+        "--input_dir",
+        type=str,
+        default=None,
+        help="Directory containing generated PDBs to evaluate (overrides config-derived path)",
+    )
+    parser.add_argument(
+        "--nsteps",
+        type=int,
+        default=None,
+        help="Override number of generation steps (default: from config, usually 400)",
+    )
+    parser.add_argument(
+        "--save_trajectory_every",
+        type=int,
+        default=None,
+        help="Save intermediate PDB structures every N steps (0 or omit to disable)",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Override output directory (default: ./inference/<config_name>)",
+    )
+    parser.add_argument(
+        "--nsamples",
+        type=int,
+        default=None,
+        help="Override number of samples to generate per length (default: from config)",
+    )
+    parser.add_argument(
+        "--lengths",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Override protein lengths to sample (e.g. --lengths 80 100 120)",
+    )
+    parser.add_argument(
+        "--solver",
+        type=str,
+        choices=["euler", "heun", "adaptive_heun", "stochastic_heun"],
+        default=None,
+        help="Solver: euler, heun (ODE), adaptive_heun (ODE, adaptive), or stochastic_heun (SDE, 2nd order)",
+    )
     args = parser.parse_args()
     if args.data_path is not None:
         os.environ["DATA_PATH"] = args.data_path
+    # Ensure DATA_PATH is set so OmegaConf interpolations don't fail during
+    # config serialization (e.g. Lightning's CSV logger). The actual path is
+    # only needed for training/evaluation, not generation.
+    os.environ.setdefault("DATA_PATH", ".")
     # Inference config
     # If config_subdir is None then use base inference config
     # Otherwise use config_subdir/some_config
@@ -79,13 +132,27 @@ def parse_args_and_cfg() -> Tuple[Dict, Dict, str]:
         else:
             config_name = args.config_name
         cfg = hydra.compose(config_name=config_name)
-        logger.info(f"Inference config {cfg}")
+
+    # CLI overrides for generation parameters
+    if args.nsteps is not None:
+        cfg.generation.args.nsteps = args.nsteps
+    if args.save_trajectory_every is not None:
+        cfg.generation.args.save_trajectory_every = args.save_trajectory_every
+    if args.nsamples is not None:
+        cfg.generation.dataset.nsamples = args.nsamples
+    if args.lengths is not None:
+        cfg.generation.dataset.nlens_cfg.nres_lens = args.lengths
+    if args.solver is not None:
+        cfg.generation.args.solver = args.solver
+
+    logger.info(f"Inference config {cfg}")
 
     return args, cfg, config_name
 
 
 def setup(
-    cfg: Dict, create_root: bool = True, config_name: str = ".", job_id: int = 0
+    cfg: Dict, create_root: bool = True, config_name: str = ".", job_id: int = 0, cpu_mode: bool = False,
+    output_dir: str = None,
 ) -> str:
     """
     Checks if metrics being computed are compatible, sets the right seed, and creates the root directory
@@ -96,9 +163,12 @@ def setup(
     """
     logger.info(" ".join(sys.argv))
 
-    assert (
-        torch.cuda.is_available()
-    ), "CUDA not available"  # Needed for ESMfold and designability
+    if cpu_mode:
+        logger.warning("Running in CPU mode - this will be slow!")
+    else:
+        assert (
+            torch.cuda.is_available()
+        ), "CUDA not available. Use --cpu flag to run on CPU (slow)."
     logger.add(
         sys.stdout,
         format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {file}:{line} | {message}",
@@ -113,18 +183,24 @@ def setup(
         or not cfg.generation.metric.compute_fid
     ), "Designability/Novelty cannot be computed together with FID"
 
-    # Set root path for this inference run
-    if "motif_task_name" in cfg.generation.dataset:
+    # Set root path for this inference run, dated by default
+    from datetime import datetime
+    date_str = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    if output_dir is not None:
+        root_path = output_dir
+    elif "motif_task_name" in cfg.generation.dataset:
         root_path = (
-            f"./inference/{config_name}_{cfg.generation.dataset.motif_task_name}"
+            f"./inference/{config_name}_{cfg.generation.dataset.motif_task_name}/{date_str}"
         )
     else:
-        root_path = f"./inference/{config_name}"
+        root_path = f"./inference/{config_name}/{date_str}"
     if create_root:
         os.makedirs(root_path, exist_ok=True)
     else:
         if not os.path.exists(root_path):
             raise ValueError("Results path %s does not exist" % root_path)
+
+    logger.info(f"Output directory: {os.path.abspath(root_path)}")
 
     # Set seed
     cfg.seed = cfg.seed + job_id  # Different seeds for different splits ids
@@ -348,7 +424,8 @@ def main():
     cfg.generation.args.get("fold_cond", False)
     njobs = cfg.get("gen_njobs", 1)
     root_path = setup(
-        cfg, create_root=True, config_name=config_name, job_id=args.job_id
+        cfg, create_root=True, config_name=config_name, job_id=args.job_id, cpu_mode=args.cpu,
+        output_dir=args.output_dir,
     )
 
     # Exit if results from analysis already exist (assumes samples already there)
@@ -365,6 +442,11 @@ def main():
 
     # Load model
     model = load_ckpt_n_configure_inference(cfg)
+
+    # Optional: compile the transformer for faster inference
+    if os.environ.get("LP_USE_COMPILE", "0") == "1":
+        logger.info("Compiling model.nn with torch.compile (mode=reduce-overhead)")
+        model.nn = torch.compile(model.nn, mode="reduce-overhead")
 
     # Create generation dataset
     cfg_gen = split_by_job(cfg_gen, args.job_id, njobs)
@@ -410,8 +492,13 @@ def main():
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
 
     # Sample model
-    trainer = L.Trainer(accelerator="gpu", devices=1)
-    predictions = trainer.predict(model, dataloader)
+    accelerator = "cpu" if args.cpu else "gpu"
+    trainer = L.Trainer(accelerator=accelerator, devices=1)
+    raw_predictions = trainer.predict(model, dataloader)
+
+    # predict_step returns (generation_list, trajectory_list) per batch.
+    predictions = [gen for gen, _traj in raw_predictions]
+    all_trajectories = [traj for _gen, traj in raw_predictions]
 
     chain_indexes = None
 
@@ -435,6 +522,66 @@ def main():
             chain_indexes=chain_indexes,
             cath_codes=dataset.cath_codes,
         )
+
+    # Save trajectory snapshots, organised by sample (one directory per sample).
+    # Each batch (one per length) has local sample indices starting at 0,
+    # so we use a global offset to give each sample a unique index.
+    # Collect: per_sample[global_idx] = [(step, coors, aatype, logits_or_None), ...]
+    per_sample = defaultdict(list)
+    global_offset = 0
+    for batch_traj in all_trajectories:
+        if not batch_traj:
+            continue
+        n_in_batch = len(batch_traj[0]["samples"])
+        for snap in batch_traj:
+            step = snap["step"]
+            for j, sample_data in enumerate(snap["samples"]):
+                coors, aatype = sample_data[0], sample_data[1]
+                logits = sample_data[2] if len(sample_data) > 2 else None
+                per_sample[global_offset + j].append((step, coors, aatype, logits))
+        global_offset += n_in_batch
+
+    for idx, entries in sorted(per_sample.items()):
+        n = entries[0][1].shape[0]
+        sample_dir = os.path.join(root_path, f"job_{args.job_id}_n_{n:03d}_trajectory_{idx:03d}")
+        os.makedirs(sample_dir, exist_ok=True)
+        for step, coors, aatype, logits in entries:
+            fname = f"job_{args.job_id}_step_{step:04d}_n_{n:03d}_sample_{idx:03d}.pdb"
+            write_prot_to_pdb(
+                prot_pos=coors.float().detach().cpu().numpy(),
+                aatype=aatype.detach().cpu().numpy(),
+                file_path=os.path.join(sample_dir, fname),
+                overwrite=True,
+                no_indexing=True,
+            )
+            # Save AA logits (softmax probabilities) as .npy alongside the PDB
+            if logits is not None:
+                import numpy as np
+                logits_path = os.path.join(sample_dir, fname.replace(".pdb", "_aa_logits.npy"))
+                np.save(logits_path, logits.float().detach().cpu().numpy())
+
+    # Write generation stats JSON sidecar
+    if hasattr(model, "_generation_stats") and model._generation_stats:
+        stats_path = os.path.join(root_path, "generation_stats.json")
+        with open(stats_path, "w") as f:
+            json.dump(model._generation_stats, f, indent=2)
+        logger.info(f"Generation stats written to {stats_path}")
+
+    # Print summary with output path and eval command
+    abs_root = os.path.abspath(root_path)
+    n_pdbs = sum(1 for f in os.listdir(root_path) if f.endswith(".pdb"))
+    print("\n" + "=" * 70)
+    print("GENERATION COMPLETE")
+    print("=" * 70)
+    print(f"  Output directory: {abs_root}")
+    print(f"  PDB files generated: {n_pdbs}")
+    print(f"\n  To evaluate this run:")
+    print(f"    python proteinfoundation/eval_trajectory.py \\")
+    print(f"      --input_dir {abs_root}")
+    print(f"\n  Or on Modal:")
+    print(f"    modal run infra/modal_app.py::eval_trajectory \\")
+    print(f"      --input-dir {abs_root}")
+    print("=" * 70 + "\n")
 
 
 if __name__ == "__main__":

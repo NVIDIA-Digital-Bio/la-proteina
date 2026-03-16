@@ -7,6 +7,7 @@ sys.path.insert(0, root)  # Adds project's root directory
 # isort: split
 
 
+import lightning as L
 import pandas as pd
 import torch
 from biotite.structure.io import load_structure
@@ -47,24 +48,37 @@ def parse_cfg_for_table(cfg: Dict) -> Tuple[List[str], Dict]:
     return columns, flat_dict
 
 
-def split_by_job(cfg: Dict, job_id: int, is_des: bool = True) -> List[str]:
+def split_by_job(cfg: Dict, job_id: int, is_des: bool = True, search_dir: str = None, find_all: bool = False) -> List[str]:
     """
     Split evaluation jobs by job id.
     For designability, select files starting with `job_{job_id}_`, as each eval job will start after the corresponding generation job finishes
     For FID, uniformly assign files to each job. We ususally only use 1 eval job for FID.
+
+    Args:
+        cfg: Config dict.
+        job_id: Job id for this evaluation split.
+        is_des: Whether this is for designability evaluation.
+        search_dir: Directory to search for PDB files.
+        find_all: If True, find all .pdb files regardless of naming convention
+            (useful when --input_dir is provided and files don't follow job_* pattern).
 
     Returns:
         List of paths to where PDBs are stored (each PDB is at a different path).
     """
     if is_des:
         sample_root_paths = []
-        for root, dirs, files in os.walk(root_path):
+        for root, dirs, files in os.walk(search_dir):
+            # Skip trajectory subdirectories — those are evaluated by eval_trajectory.py
+            if "trajectory_step_" in root:
+                continue
             for file in files:
-                if file.startswith(f"job_{job_id}_") and file.endswith(".pdb"):
+                if not file.endswith(".pdb"):
+                    continue
+                if find_all or file.startswith(f"job_{job_id}_"):
                     sample_root_paths.append(os.path.join(root, file))
 
         logger.info(
-            f"Job id {job_id} for designability or novelty evaluation for {len(sample_root_paths)} files starting with `job_{job_id}_`"
+            f"Job id {job_id} for designability or novelty evaluation for {len(sample_root_paths)} PDB files"
         )
     else:
         raise NotImplementedError("New metrics not implemented.")
@@ -398,12 +412,22 @@ if __name__ == "__main__":
     args, cfg, config_name = parse_args_and_cfg()
     run_name = cfg.run_name_
     ncpus = cfg.ncpus_
-    root_path = setup(
-        cfg, create_root=False, config_name=config_name, job_id=args.job_id
-    )
+
+    if args.input_dir is not None:
+        # Use the user-provided directory instead of the config-derived path.
+        root_path = args.input_dir
+        if not os.path.exists(root_path):
+            raise ValueError(f"Input directory does not exist: {root_path}")
+        # Still need seeding from setup, but skip path construction.
+        cfg.seed = cfg.seed + args.job_id
+        L.seed_everything(cfg.seed)
+    else:
+        root_path = setup(
+            cfg, create_root=False, config_name=config_name, job_id=args.job_id
+        )
 
     cfg_metric = cfg.generation.metric
-    
+
     # Code for designability
     if cfg_metric.compute_designability:
         gen_njobs = cfg.get("gen_njobs", 1)
@@ -411,7 +435,11 @@ if __name__ == "__main__":
         assert (
             gen_njobs == eval_njobs
         ), f"The numbers of generation and evaluation jobs for traditaional metrics should be equal."
-        samples_paths = split_by_job(cfg, args.job_id, is_des=True)
+        samples_paths = split_by_job(
+            cfg, args.job_id, is_des=True,
+            search_dir=root_path,
+            find_all=(args.input_dir is not None),
+        )
         df = compute_traditional_metrics(cfg_metric, samples_paths, args.job_id, ncpus)
         if "motif_task_name" in cfg.generation.dataset:
             csv_filename = f"results_{config_name}_{cfg.generation.dataset.motif_task_name}_{args.job_id}.csv"
