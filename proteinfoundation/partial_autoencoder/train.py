@@ -256,6 +256,12 @@ def main(cfg_exp) -> None:
     # Train
     plugins = [SLURMEnvironment(auto_requeue=True)] if is_cluster_run else []
     show_prog_bar = show_prog_bar or not is_cluster_run
+    # When using a token-budgeted BatchSampler, Lightning must not auto-wrap
+    # the inner sampler with DistributedSampler — sharding is handled by the
+    # BatchSampler (via the inner ClusterSampler in cluster modes).
+    use_distributed_sampler = (
+        cfg_data.datamodule.get("max_tokens_per_batch") in (None, 0, False)
+    )
     trainer = L.Trainer(
         max_epochs=cfg_exp.opt.max_epochs,
         accelerator=cfg_exp.hardware.accelerator,
@@ -275,6 +281,7 @@ def main(cfg_exp) -> None:
         precision=get_training_precision(cfg_exp, is_cluster_run),
         gradient_clip_algorithm="norm",
         gradient_clip_val=1.0,
+        use_distributed_sampler=use_distributed_sampler,
     )
     trainer.fit(model, datamodule, ckpt_path=resume_ckpt_path)
     # If resume_ckpt_path is None then it creates a new optimizer

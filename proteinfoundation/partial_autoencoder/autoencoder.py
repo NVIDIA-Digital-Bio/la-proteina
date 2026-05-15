@@ -334,8 +334,20 @@ class AutoEncoder(L.LightningModule):
             src_b = output_enc_struct[ct_cfg.source]
             h_a = self.ct_head(src_a)
             h_b = self.ct_head(src_b)
+
+            # Optionally subsample residues to cap the [M, M] InfoNCE matrix.
+            ct_mask = mask
+            K = ct_cfg.get("minibatch_size", None)
+            if K is not None:
+                flat_idx = mask.nonzero(as_tuple=False)
+                if flat_idx.shape[0] > K:
+                    perm = torch.randperm(flat_idx.shape[0], device=mask.device)[:K]
+                    flat_idx = flat_idx[perm]
+                    ct_mask = torch.zeros_like(mask)
+                    ct_mask[flat_idx[:, 0], flat_idx[:, 1]] = True
+
             ct_out = symmetric_infonce(
-                h_a=h_a, h_b=h_b, mask=mask, logit_scale=self.ct_head.logit_scale
+                h_a=h_a, h_b=h_b, mask=ct_mask, logit_scale=self.ct_head.logit_scale
             )
             w_ct = self._ct_warmup_weight()
             train_loss = train_loss + w_ct * ct_out["loss"]

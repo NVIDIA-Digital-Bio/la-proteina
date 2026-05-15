@@ -2,11 +2,14 @@ from abc import ABC, abstractmethod
 from typing import Callable, Dict, Iterable, List, Literal, Optional
 
 import lightning as L
+import torch
 from loguru import logger
+from torch.utils.data import RandomSampler, SequentialSampler
 from torch_geometric import transforms as T
 from torch_geometric.data import Dataset
 from torch_geometric.loader import DataLoader
 
+from proteinfoundation.datasets.token_batch_sampler import TokenBudgetBatchSampler
 from proteinfoundation.utils.cluster_utils import ClusterSampler
 from proteinfoundation.utils.dense_padding_data_loader import DensePaddingDataLoader
 
@@ -24,6 +27,8 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         batch_size: int = 32,
         num_workers: int = 32,
         pin_memory: bool = False,
+        max_tokens_per_batch: Optional[int] = None,
+        max_batch_size: Optional[int] = None,
     ):
         """Initialising the base data module class.
 
@@ -62,10 +67,13 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
+        self.max_tokens_per_batch = max_tokens_per_batch
+        self.max_batch_size = max_batch_size
         self.train_ds = None
         self.val_ds = None
         self.test_ds = None
         self.clusterid_to_seqid_mappings = None  # for cluster sampling
+        self.lengths_per_split: Dict[str, torch.Tensor] = {}
 
     def setup(self, stage: Optional[str] = None):
         if stage == "fit" or stage is None:
@@ -113,6 +121,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
         dataset: Dataset,
         shuffle: bool = False,
         clusterid_to_seqid_mapping: Dict[str, List[str]] = None,
+        split: Optional[str] = None,
     ) -> DataLoader:
         """Returns the dataloader for the corresponding dataset.
 
@@ -120,6 +129,8 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             dataset (Dataset): PyG dataset for which the dataloader will be created.
             shuffle (bool, optional): Whether the dataloader should be shuffled. Defaults to False. False when cluster_id mapping is given.
             clusterid_to_seqid_mapping (Dict[str, List[str]], optional): Maps cluster ids to sequence ids. Defaults to None.
+            split (Optional[str]): Split name ("train"/"val"/"test") used to look up
+                precomputed lengths for token-budgeted batching.
 
         Returns:
             DataLoader: Dataloader to be used by model.
@@ -134,16 +145,56 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
                 clusterid_to_seqid_mapping=clusterid_to_seqid_mapping,
                 sampling_mode=self.sampling_mode,
             )
+            inner_shards_in_distributed = True
             shuffle = False
         elif self.sampling_mode == "random":
             sampler = None
-            shuffle = shuffle
+            inner_shards_in_distributed = False
         else:
             raise ValueError(
                 f"Sampling mode is {self.sampling_mode}, but clusterid_to_seqid_mapping is {clusterid_to_seqid_mapping}"
             )
 
         dataloader_class = DensePaddingDataLoader if self.batch_padding else DataLoader
+
+        if self.max_tokens_per_batch is not None:
+            # Token-budgeted path requires a concrete inner index sampler (a
+            # batch_sampler cannot coexist with shuffle/sampler=None).
+            if sampler is None:
+                sampler = RandomSampler(dataset) if shuffle else SequentialSampler(dataset)
+            lengths = self.lengths_per_split.get(split) if split is not None else None
+            if lengths is None:
+                raise RuntimeError(
+                    f"max_tokens_per_batch is set but no lengths registered for "
+                    f"split={split!r}. Datamodule must populate self.lengths_per_split."
+                )
+            if torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+                world_size = torch.distributed.get_world_size()
+            else:
+                rank, world_size = 0, 1
+            batch_sampler = TokenBudgetBatchSampler(
+                index_sampler=sampler,
+                lengths=lengths,
+                max_tokens_per_batch=self.max_tokens_per_batch,
+                max_batch_size=self.max_batch_size,
+                drop_last=True,
+                rank=rank,
+                world_size=world_size,
+                shard_in_sampler=not inner_shards_in_distributed,
+            )
+            logger.info(
+                f"Using TokenBudgetBatchSampler for split={split!r}: "
+                f"max_tokens_per_batch={self.max_tokens_per_batch}, "
+                f"max_batch_size={self.max_batch_size}, "
+                f"shard_in_sampler={not inner_shards_in_distributed}"
+            )
+            return dataloader_class(
+                dataset,
+                batch_sampler=batch_sampler,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+            )
 
         return dataloader_class(
             dataset,
@@ -168,6 +219,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             dataset=self.train_ds,
             shuffle=shuffle,
             clusterid_to_seqid_mapping=clusterid_to_seqid_mapping,
+            split="train",
         )
         return train_dl
 
@@ -185,6 +237,7 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             dataset=self.val_ds,
             shuffle=shuffle,
             clusterid_to_seqid_mapping=clusterid_to_seqid_mapping,
+            split="val",
         )
         return val_dl
 
@@ -201,5 +254,6 @@ class BaseLightningDataModule(L.LightningDataModule, ABC):
             dataset=self.test_ds,
             shuffle=shuffle,
             clusterid_to_seqid_mapping=clusterid_to_seqid_mapping,
+            split="test",
         )
         return test_dl

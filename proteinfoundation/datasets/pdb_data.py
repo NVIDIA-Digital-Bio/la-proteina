@@ -417,6 +417,8 @@ class PDBLightningDataModule(BaseLightningDataModule):
         batch_size: int = 32,
         num_workers: int = 32,
         pin_memory: bool = False,
+        max_tokens_per_batch: Optional[int] = None,
+        max_batch_size: Optional[int] = None,
         **kwargs,
     ):
         """Initializes the PDBLightningDataModule.
@@ -464,6 +466,8 @@ class PDBLightningDataModule(BaseLightningDataModule):
             batch_size=batch_size,
             num_workers=num_workers,
             pin_memory=pin_memory,
+            max_tokens_per_batch=max_tokens_per_batch,
+            max_batch_size=max_batch_size,
             **kwargs,
         )
         self.data_dir = pathlib.Path(data_dir)
@@ -755,6 +759,17 @@ class PDBLightningDataModule(BaseLightningDataModule):
         else:
             chains = None
             file_names = [f"{pdb}" for pdb in pdb_codes]
+
+        # Precompute per-index lengths for token-budgeted batching.
+        if "length" in df_split.columns:
+            self.lengths_per_split[split] = torch.as_tensor(
+                df_split["length"].to_numpy(), dtype=torch.long
+            )
+        elif self.max_tokens_per_batch is not None:
+            raise RuntimeError(
+                f"max_tokens_per_batch is set but split DataFrame for {split!r} "
+                f"has no 'length' column; cannot construct TokenBudgetBatchSampler."
+            )
 
         return PDBDataset(
             pdb_codes=pdb_codes,

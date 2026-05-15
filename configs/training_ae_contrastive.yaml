@@ -36,6 +36,7 @@ loss:
     init_temperature: 0.07
     source: "mean"
     mask_features: ["residue_type"]
+    minibatch_size: null # If set, randomly subsample this many residues for the [M, M] InfoNCE matrix per step
 
 force_precision_f32: False
 

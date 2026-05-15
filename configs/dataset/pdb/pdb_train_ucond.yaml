@@ -12,9 +12,11 @@ datamodule:
     - _target_: "proteinfoundation.datasets.transforms.CenterStructureTransform"
     - _target_: "proteinfoundation.datasets.transforms.GlobalRotationTransform" # Transforms to apply to dataset examples
     - _target_: "proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform"
-  batch_size: 4 # Batch size for dataloader
+  batch_size: 4 # Batch size for dataloader (ignored when max_tokens_per_batch is set)
   num_workers: 16 # Number of workers for dataloader
   pin_memory: True # Pin memory for dataloader
+  max_tokens_per_batch: null # If set, packs samples by total residue count (e.g. 1500 for 80GB H100)
+  max_batch_size: null # Optional cap on samples per batch when using max_tokens_per_batch
 
   dataselector:
     _target_: "proteinfoundation.datasets.pdb_data.PDBDataSelector"
